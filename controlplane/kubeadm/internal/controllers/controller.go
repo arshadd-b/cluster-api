@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1beta1"
@@ -248,7 +249,14 @@ func (r *KubeadmControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 			// Otherwise this condition can lead to a delay in provisioning MachineDeployments when MachineSet preflight checks are enabled.
 			// The alternative solution to this requeue would be watching the relevant pods inside each workload cluster which would be very expensive.
 			if conditions.IsFalse(kcp, controlplanev1.ControlPlaneComponentsHealthyCondition) {
-				res = ctrl.Result{RequeueAfter: 20 * time.Second}
+				//res = ctrl.Result{RequeueAfter: 20 * time.Second}
+				// Create a watch on the nodes in the Cluster.
+				if err := r.watchClusterPods(ctx, cluster); err != nil {
+					fmt.Println("YYYYY::", err)
+					//s.nodeGetError = err
+					res = ctrl.Result{}
+					reterr = err
+				}
 			}
 		}
 	}()
@@ -257,9 +265,132 @@ func (r *KubeadmControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		// Handle deletion reconciliation loop.
 		return r.reconcileDelete(ctx, controlPlane)
 	}
+	if err := r.watchClusterPods(ctx, cluster); err != nil {
+		log.Error(err, "YYYYYY")
+		fmt.Println("YYYYY::", err)
+		//s.nodeGetError = err
+		res = ctrl.Result{}
+		reterr = err
+	}
 
 	// Handle normal reconciliation loop.
 	return r.reconcile(ctx, controlPlane)
+}
+
+func (r *KubeadmControlPlaneReconciler) watchClusterPods(ctx context.Context, cluster *clusterv1.Cluster) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	if !conditions.IsTrue(cluster, clusterv1.ControlPlaneInitializedCondition) {
+		log.V(5).Info("Skipping node watching setup because control plane is not initialized")
+		return nil
+	}
+
+	return r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), clustercache.NewWatcher(clustercache.WatcherOptions{
+		Name:         "kcp-watchPods",
+		Watcher:      r.controller,
+		Kind:         &corev1.Pod{},
+		EventHandler: handler.EnqueueRequestsFromMapFunc(r.testPods),
+		//Predicates:   []predicate.TypedPredicate[client.Object]{predicates.TypedResourceIsChanged[client.Object](r.Client.Scheme(), *r.predicateLog)},
+	}))
+}
+
+func (r *KubeadmControlPlaneReconciler) testPods(ctx context.Context, o client.Object) []reconcile.Request {
+	log := ctrl.LoggerFrom(ctx)
+	pod, ok := o.(*corev1.Pod)
+	if !ok {
+		panic(fmt.Sprintf("Expected a Pod but got a %T", o))
+	}
+	log.Info("inside testPods::")
+	// Match by namespace when the node has the annotation.
+	labels := pod.GetLabels()
+	for k, v := range labels {
+		if k == "component" {
+			if v == "etcd" || v == "kube-apiserver" || v == "kube-controller-manager" || v == "kube-scheduler" {
+				// ownerRefer := pod.GetOwnerReferences()
+				log.Info("reference::", pod.Spec.NodeName)
+				nodename := pod.Spec.NodeName
+				// Match by nodeName and status.nodeRef.name.
+				machineList := &clusterv1.MachineList{}
+				if err := r.Client.List(
+					ctx,
+					machineList,
+				); err != nil {
+					log.Error(err, "got error when getting machine")
+				}
+
+				for _, l := range machineList.Items {
+					log.Info("printing machinelist", l)
+					if l.Name == nodename {
+						log.Info("got machine")
+						break
+					}
+
+				}
+				clusterList := &clusterv1.ClusterList{}
+				if err := r.Client.List(
+					ctx,
+					clusterList,
+				); err != nil {
+					log.Error(err, "got error when getting cluster")
+					//return nil
+				}
+
+				log.Info("cluster details", clusterList)
+				for _, value := range clusterList.Items {
+					log.Info("cluster :::", value.Name)
+
+				}
+
+				//return []reconcile.Request{{NamespacedName: client.ObjectKey(clusterList.Items[0].Spec.ControlPlaneRef)}}
+
+			}
+		}
+		log.Info("keyyyyyyy:: %v", k)
+		log.Info("vvvvvalue:: %v", v)
+	}
+
+	//remoteClient, err := r.ClusterCache.GetClient(ctx, o)
+	//mp := map[client.Object]cache.ByObject{}
+	// &corev1.Pod{}: {
+	// 	Namespaces: map[string]cache.Config{
+	// 		metav1.NamespaceSystem: {
+	// 			LabelSelector: podSelector,
+	// 		},
+	// 	},
+	// },
+
+	//podList := &corev1.PodList{}
+	// r.ClusterCache.GetClient(ctx, )
+	// listOpts := []client.ListOption{
+	// 	client.InNamespace(metav1.NamespaceSystem),
+	// 	client.MatchingLabels{
+	// 		"component": "kube-apiserver",
+	// 		"tier":      "control-plane"},
+	// 	// client.MatchingLabels{
+	// 	// 	"component": "kube-controller-manager",
+	// 	// 	"tier":      "control-plane"},
+	// 	// client.MatchingLabels{
+	// 	// 	"component": "kube-scheduler",
+	// 	// 	"tier":      "control-plane"},
+	// 	// client.MatchingLabels{
+	// 	// 	"component": "etcd",
+	// 	// 	"tier":      "control-plane"},
+	// }
+
+	// log.Info("reacheddddd:: %v", podList)
+
+	// if err := r.Client.List(ctx, podList, client.MatchingLabels{"component": "kube-apiserver", "tier": "control-plane"}); err != nil {
+	// 	log.Error(err, "TTTTTTTT")
+
+	// }
+
+	// fmt.Println("yyyyyyyyy", podList)
+	// for _, pod := range podList.Items {
+	// 	fmt.Println("WWWWWWW", pod.Name)
+	// 	log.Info("reacheddddd:: %v", pod.Name)
+	// }
+
+	return nil
 }
 
 // initControlPlaneScope initializes the control plane scope; this includes also checking for orphan machines and
